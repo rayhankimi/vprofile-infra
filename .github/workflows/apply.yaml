@@ -37,7 +37,7 @@ jobs:
         run: terraform init
 
       - name: Terraform apply
-        run: terraform apply
+        run: terraform apply -auto-approve
 
       - name: Notify in Discord
         if: always() 
