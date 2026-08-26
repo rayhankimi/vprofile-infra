@@ -1,0 +1,126 @@
+name: Terraform Infra Drift Detection
+
+on:
+  # schedule:
+  #   - cron: "0 22 * * *" #6 wita
+  workflow_dispatch:  # Manual Activation
+
+concurrency:
+  group: terraform-state
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: read
+  issues: write
+
+env:
+  TF_IN_AUTOMATION: "true"
+  AWS_REGION: ap-southeast-1
+
+jobs:
+  drift:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::233231935566:role/vprofile-infra-oidc
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.12.2"
+
+      - name: Terraform init
+        run: terraform init -input=false
+
+      - name: Terraform plan (Drift Check)
+        id: plan
+        run: |
+          set +e
+          terraform plan -input=false -no-color -detailed-exitcode -out=drift.tfplan
+          code=$?
+          set -e
+          echo "exitcode=$code" >> "$GITHUB_OUTPUT"
+          if [ "$code" -eq 2 ]; then
+            terraform show -no-color drift.tfplan > plan.txt
+          fi
+
+      - name: Plan error
+        if: steps.plan.outputs.exitcode == '1'
+        run: |
+          echo "::error::failed tf plan, check log bellow"
+
+      - name: No drift (expected plan)
+        if: steps.plan.outputs.exitcode == '0'
+        run: |
+          echo "State matched. No drift."
+
+      - name: Report drift
+        if: steps.plan.outputs.exitcode == '2'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+
+            let plan = fs.readFileSync('plan.txt','utf8');
+
+            const limit = 60000
+            if (plan.length > limit) {
+              plan = plan.slice(0, limit) + '\n\n... (Trimmed by body issues limitation)'
+            }
+            
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+
+            const title = 'Terraform drift detected'
+            const body = [
+              `Drift detected with workflow run: ${runUrl}`,
+              `At: ${new Date().toISOString()}`,
+              '',
+              '```',
+              plan,
+              '```',
+            ].join('\n');
+
+            const { data: issues } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'drift',
+              per_page: 1,
+            })
+
+            if (issues.length > 0) {
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo, 
+                issue_number: issues[0].number,
+                body,
+              });
+              core.info(`Issue #${issues[0].number} updated`)
+            } else {
+                const { data: issue } = await github.rest.issues.create({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  title,
+                  body,
+                  labels: ['drift']
+                });
+                core.info(`Issue #${issue.number} created`)
+            }
+            core.setFailed("Drift detected, please check issues that labelled with 'drift'.")
+
+      - name: Notify in Discord
+        if: always()
+        uses: sarisia/actions-status-discord@v1
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK }}
+          status: ${{ job.status }}
+          content: "<@294010785330495489> Terraform drift check :"
+
